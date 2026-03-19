@@ -1,9 +1,3 @@
-/**
- * Cloudflare Worker Telegram Bot - Web Crawler
- * Integrated with Browser Rendering /crawl endpoint, Workers KV, and R2.
- * Includes interactive Telegram Inline Menu for endpoint configuration.
- */
-
 export interface Env {
 	CLOUDFLARE_ACCOUNT_ID: string;
 	CLOUDFLARE_API_TOKEN: string;
