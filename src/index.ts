@@ -104,6 +104,29 @@ async function getUserConfig(chatId: number, env: Env): Promise<CrawlConfig> {
 	return getDefaultConfig();
 }
 
+/**
+ * Validates and increments the user's daily submission quota.
+ * Limits users to 2 requests per UTC day.
+ * Auto-expires keys after 48 hours to prevent KV bloat.
+ */
+async function consumeDailyRateLimit(chatId: number, env: Env): Promise<boolean> {
+	const todayDateString = new Date().toISOString().split('T')[0];
+	const rateLimitKey = `ratelimit:${chatId}:${todayDateString}`;
+	
+	const currentUsageStr = await env.CRAWL_KV.get(rateLimitKey);
+	const currentUsage = currentUsageStr ? parseInt(currentUsageStr, 10) : 0;
+
+	if (currentUsage >= 2) {
+		return false;
+	}
+
+	const newUsage = currentUsage + 1;
+	// 172800 seconds = 48 hours. Ensures the key covers all timezones and is safely purged.
+	await env.CRAWL_KV.put(rateLimitKey, newUsage.toString(), { expirationTtl: 172800 });
+	
+	return true;
+}
+
 function buildSettingsKeyboard(config: CrawlConfig) {
 	return {
 		inline_keyboard: [
@@ -144,6 +167,8 @@ async function handleMessage(message: TelegramMessage, env: Env): Promise<void> 
 	if (text.startsWith('/start')) {
 		const welcomeMsg = `🤖 *Crawl Bot*\n\n` + 
 			`Send me a URL starting with \`http://\` or \`https://\` to automatically initiate a crawl using your customized settings.\n\n` +
+			`*Constraints:*\n` +
+			`• Limit: 2 URLs per day\n\n` +
 			`*Commands:*\n` +
 			`/settings - Configure limits, depths, formats, and behavior.\n` +
 			`/status - Check the progress of your active job.\n\n` +
@@ -175,11 +200,21 @@ async function handleMessage(message: TelegramMessage, env: Env): Promise<void> 
 	}
 
 	if (text.startsWith('http://') || text.startsWith('https://')) {
+		const isPermitted = await consumeDailyRateLimit(chatId, env);
+		if (!isPermitted) {
+			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ *Daily Limit Exceeded*\n\nYou have reached the maximum allowance of 2 URLs per day. Please try again tomorrow.`);
+			return;
+		}
 		await initiateCrawl(text, chatId, env, false);
 		return;
 	} 
 	
 	if (text.startsWith('{')) {
+		const isPermitted = await consumeDailyRateLimit(chatId, env);
+		if (!isPermitted) {
+			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `⚠️ *Daily Limit Exceeded*\n\nYou have reached the maximum allowance of 2 JSON jobs per day. Please try again tomorrow.`);
+			return;
+		}
 		await initiateCrawl(text, chatId, env, true);
 		return;
 	}
