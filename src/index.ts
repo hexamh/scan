@@ -1,7 +1,7 @@
 /**
  * Cloudflare Worker Telegram Bot - Web Crawler
  * Integrated with Browser Rendering /crawl endpoint, Workers KV, and R2.
- * Features: Easy CLI-style arguments for limit and depth.
+ * Includes interactive Telegram Inline Menu for endpoint configuration.
  */
 
 export interface Env {
@@ -12,11 +12,54 @@ export interface Env {
 	MY_BUCKET: R2Bucket;
 }
 
+interface TelegramUpdate {
+	update_id: number;
+	message?: TelegramMessage;
+	callback_query?: TelegramCallbackQuery;
+}
+
+interface TelegramMessage {
+	message_id: number;
+	chat: { id: number };
+	text?: string;
+}
+
+interface TelegramCallbackQuery {
+	id: string;
+	data: string;
+	message: TelegramMessage;
+}
+
+interface CrawlOptions {
+	includeExternalLinks: boolean;
+	includeSubdomains: boolean;
+}
+
+interface CrawlConfig {
+	limit: number;
+	depth: number;
+	formats: string[];
+	render: boolean;
+	options: CrawlOptions;
+}
+
+function getDefaultConfig(): CrawlConfig {
+	return {
+		limit: 50,
+		depth: 2,
+		formats: ['markdown'],
+		render: true,
+		options: {
+			includeExternalLinks: false,
+			includeSubdomains: false
+		}
+	};
+}
+
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// Setup Webhook endpoint
 		if (request.method === 'GET' && url.pathname === '/setup_webhook') {
 			const webhookUrl = `${url.origin}/webhook`;
 			const telegramApi = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`;
@@ -30,13 +73,14 @@ export default {
 			}
 		}
 
-		// Webhook receiver
 		if (request.method === 'POST' && url.pathname === '/webhook') {
 			try {
-				const update: any = await request.json();
+				const update: TelegramUpdate = await request.json();
 				
 				if (update.message && update.message.text) {
 					ctx.waitUntil(handleMessage(update.message, env));
+				} else if (update.callback_query) {
+					ctx.waitUntil(handleCallback(update.callback_query, env));
 				}
 				
 				return new Response('OK', { status: 200 });
@@ -49,24 +93,74 @@ export default {
 	},
 } satisfies ExportedHandler<Env>;
 
-/**
- * Route commands and messages
- */
-async function handleMessage(message: any, env: Env): Promise<void> {
+async function getUserConfig(chatId: number, env: Env): Promise<CrawlConfig> {
+	const stored = await env.CRAWL_KV.get(`chat:${chatId}:config`);
+	if (stored) {
+		try {
+			const parsed = JSON.parse(stored);
+			return { 
+				...getDefaultConfig(), 
+				...parsed,
+				options: { ...getDefaultConfig().options, ...(parsed.options || {}) }
+			};
+		} catch (e) {
+			return getDefaultConfig();
+		}
+	}
+	return getDefaultConfig();
+}
+
+function buildSettingsKeyboard(config: CrawlConfig) {
+	return {
+		inline_keyboard: [
+			[
+				{ text: `Limit: ${config.limit === 10 ? '✅ 10' : '10'}`, callback_data: `cfg:limit:10` },
+				{ text: config.limit === 50 ? '✅ 50' : '50', callback_data: `cfg:limit:50` },
+				{ text: config.limit === 100 ? '✅ 100' : '100', callback_data: `cfg:limit:100` },
+				{ text: config.limit === 500 ? '✅ 500' : '500', callback_data: `cfg:limit:500` }
+			],
+			[
+				{ text: `Depth: ${config.depth === 1 ? '✅ 1' : '1'}`, callback_data: `cfg:depth:1` },
+				{ text: config.depth === 2 ? '✅ 2' : '2', callback_data: `cfg:depth:2` },
+				{ text: config.depth === 5 ? '✅ 5' : '5', callback_data: `cfg:depth:5` },
+				{ text: config.depth === 10 ? '✅ 10' : '10', callback_data: `cfg:depth:10` }
+			],
+			[
+				{ text: `Browser Render: ${config.render ? '✅ ON' : '❌ OFF'}`, callback_data: `cfg:render:toggle` },
+			],
+			[
+				{ text: `HTML ${config.formats.includes('html') ? '✅' : '❌'}`, callback_data: `cfg:fmt:html` },
+				{ text: `MD ${config.formats.includes('markdown') ? '✅' : '❌'}`, callback_data: `cfg:fmt:markdown` },
+				{ text: `JSON ${config.formats.includes('json') ? '✅' : '❌'}`, callback_data: `cfg:fmt:json` }
+			],
+			[
+				{ text: `External Links: ${config.options.includeExternalLinks ? '✅ ON' : '❌ OFF'}`, callback_data: `cfg:ext:toggle` },
+			],
+			[
+				{ text: `Subdomains: ${config.options.includeSubdomains ? '✅ ON' : '❌ OFF'}`, callback_data: `cfg:sub:toggle` }
+			]
+		]
+	};
+}
+
+async function handleMessage(message: TelegramMessage, env: Env): Promise<void> {
 	const chatId = message.chat.id;
-	const text = message.text.trim();
+	const text = message.text?.trim() || '';
 
 	if (text.startsWith('/start')) {
-		const welcomeMsg = `🤖 *Crawl Bot*\n\n` + 
-			`Send me a URL to crawl. You can easily set a custom limit and depth by adding numbers after the URL.\n\n` +
-			`*Examples:*\n` +
-			`1. \`https://example.com\` (Defaults: 50k limit, 50k depth)\n` +
-			`2. \`https://example.com 100\` (Limit 100 pages)\n` +
-			`3. \`https://example.com 500 3\` (Limit 500 pages, Depth 3)\n\n` +
-			`_You can also still send a raw JSON configuration payload for authenticated scraping._\n\n` +
-			`Use \`/status\` to check the progress of your active job.`;
+		const welcomeMsg = `🤖 *Browser Rendering Crawl Bot*\n\n` + 
+			`Send me a URL starting with \`http://\` or \`https://\` to automatically initiate a crawl using your customized settings.\n\n` +
+			`*Commands:*\n` +
+			`/settings - Configure limits, depths, formats, and behavior.\n` +
+			`/status - Check the progress of your active job.\n\n` +
+			`_You can also send a raw JSON configuration payload for fully custom scrapes._`;
 		
 		await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, welcomeMsg);
+		return;
+	}
+
+	if (text.startsWith('/settings')) {
+		await sendSettingsMenu(chatId, env);
 		return;
 	}
 
@@ -86,37 +180,73 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 		return;
 	}
 
-	// Handle standard URLs with easy parsing
 	if (text.startsWith('http://') || text.startsWith('https://')) {
-		// Split by spaces to extract URL, Limit, and Depth
-		const parts = text.split(/\s+/);
-		const targetUrl = parts[0];
-		
-		const limit = parts.length > 1 ? parseInt(parts[1], 10) : 50000;
-		const depth = parts.length > 2 ? parseInt(parts[2], 10) : 50000;
-
-		if (isNaN(limit) || isNaN(depth)) {
-			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, '⚠️ Limit and Depth must be valid numbers.\n*Example:* `https://example.com 100 2`');
-			return;
-		}
-
-		await initiateCrawl(targetUrl, chatId, env, false, limit, depth);
+		await initiateCrawl(text, chatId, env, false);
 		return;
 	} 
 	
-	// Handle raw JSON payloads for authenticated crawling
 	if (text.startsWith('{')) {
 		await initiateCrawl(text, chatId, env, true);
 		return;
 	}
 
-	await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, '⚠️ Please send a valid URL starting with `http://` or `https://` (or a JSON configuration object).');
+	await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, '⚠️ Please send a valid URL starting with `http://` or `https://`, use `/settings`, or send a JSON configuration object.');
 }
 
-/**
- * Initiates a new crawl and saves state to KV
- */
-async function initiateCrawl(input: string, chatId: number, env: Env, isJson: boolean, customLimit = 50000, customDepth = 50000): Promise<void> {
+async function handleCallback(callbackQuery: TelegramCallbackQuery, env: Env): Promise<void> {
+	const chatId = callbackQuery.message.chat.id;
+	const messageId = callbackQuery.message.message_id;
+	const data = callbackQuery.data;
+	
+	if (data.startsWith('cfg:')) {
+		const parts = data.split(':');
+		const key = parts[1];
+		const val = parts[2];
+		
+		const config = await getUserConfig(chatId, env);
+		
+		if (key === 'limit') config.limit = parseInt(val, 10);
+		if (key === 'depth') config.depth = parseInt(val, 10);
+		if (key === 'render') config.render = !config.render;
+		if (key === 'ext') config.options.includeExternalLinks = !config.options.includeExternalLinks;
+		if (key === 'sub') config.options.includeSubdomains = !config.options.includeSubdomains;
+		if (key === 'fmt') {
+			if (config.formats.includes(val)) {
+				if (config.formats.length > 1) {
+					config.formats = config.formats.filter((f) => f !== val);
+				}
+			} else {
+				config.formats.push(val);
+			}
+		}
+		
+		await env.CRAWL_KV.put(`chat:${chatId}:config`, JSON.stringify(config));
+		await sendSettingsMenu(chatId, env, messageId);
+	}
+	
+	await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ callback_query_id: callbackQuery.id })
+	});
+}
+
+async function sendSettingsMenu(chatId: number, env: Env, messageId?: number): Promise<void> {
+	const config = await getUserConfig(chatId, env);
+	
+	const text = `⚙️ *Crawl Endpoint Settings*\n\n` +
+				 `Configure parameters for the \`/crawl\` endpoint. These settings automatically apply to any URL you submit to the bot.`;
+				 
+	const keyboard = buildSettingsKeyboard(config);
+
+	if (messageId) {
+		await editTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, messageId, text, keyboard);
+	} else {
+		await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, text, keyboard);
+	}
+}
+
+async function initiateCrawl(input: string, chatId: number, env: Env, isJson: boolean): Promise<void> {
 	const apiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/crawl`;
 	
 	let payload: Record<string, unknown>;
@@ -124,19 +254,19 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 	if (isJson) {
 		try {
 			payload = JSON.parse(input);
-			if (!payload.formats) payload.formats = ["markdown"];
-			if (payload.limit === undefined) payload.limit = customLimit;
-			if (payload.depth === undefined) payload.depth = customDepth;
 		} catch (e) {
 			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ *Invalid JSON Configuration.*\nVerify your formatting and try again.`);
 			return;
 		}
 	} else {
+		const config = await getUserConfig(chatId, env);
 		payload = {
-			url: input,
-			formats: ["markdown"], 
-			limit: customLimit,
-			depth: customDepth
+			url: input.trim(),
+			formats: config.formats, 
+			limit: config.limit,
+			depth: config.depth,
+			render: config.render,
+			options: config.options
 		};
 	}
 
@@ -152,16 +282,16 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 
 		const data: any = await response.json();
 
-		if (data.success && (data.result?.job_id || data.result?.id)) {
+		if (response.ok && data.success && (data.result?.job_id || data.result?.id)) {
 			const jobId = data.result.job_id || data.result.id;
-			
-			// KV: Cache this ID as the active job for the user
 			await env.CRAWL_KV.put(`chat:${chatId}:latest_job`, jobId);
 
-			const successMsg = `✅ *Crawl Job Initiated!*\n\n*Target:* ${payload.url}\n*Job ID:* \`${jobId}\`\n*Config:* ${payload.limit} pages | ${payload.depth} clicks deep\n\nCheck progress anytime by sending:\n\`/status\``;
+			const cfgFmt = isJson ? "Custom JSON Payload" : `${payload.limit} pages | ${payload.depth} clicks | ${payload.render ? 'Rendered' : 'Static'} | ${(payload.formats as string[]).join(',')}`;
+			const successMsg = `✅ *Crawl Job Initiated!*\n\n*Target:* ${payload.url}\n*Job ID:* \`${jobId}\`\n*Config:* ${cfgFmt}\n\nCheck progress anytime by sending:\n\`/status\``;
+			
 			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, successMsg);
 		} else {
-			const errorMsg = data.errors?.[0]?.message || 'Unknown error occurred.';
+			const errorMsg = data.errors?.[0]?.message || JSON.stringify(data);
 			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ *Failed to initiate crawl:*\n${errorMsg}`);
 		}
 	} catch (err) {
@@ -169,9 +299,6 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 	}
 }
 
-/**
- * Validates job status and leverages R2 for document generation and caching
- */
 async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promise<void> {
 	const apiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/crawl/${jobId}`;
 	
@@ -186,7 +313,7 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 
 		const data: any = await response.json();
 
-		if (data.success && data.result) {
+		if (response.ok && data.success && data.result) {
 			const result = data.result;
 			const status = result.status || 'unknown';
 			const records = result.records || result.data || result.items;
@@ -195,35 +322,47 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 				const fileName = `crawled_content_${jobId}.md`;
 				let combinedMarkdown = '';
 				
-				// R2: Check if we have already compiled and stored this document
 				const existingObject = await env.MY_BUCKET.get(fileName);
 
 				if (existingObject) {
 					combinedMarkdown = await existingObject.text();
 				} else {
-					// Compile markdown from the raw API records
 					combinedMarkdown = `# Crawl Results for Job ${jobId}\n\n`;
 					
 					for (const record of records) {
 						combinedMarkdown += `## Source: ${record.url || 'Unknown URL'}\n\n`;
-						const md = record.markdown || (record.content && record.content.markdown) || '';
+						let hasContent = false;
 						
-						if (md) {
-							combinedMarkdown += md + '\n\n';
-						} else {
-							combinedMarkdown += `*No markdown returned for this page.*\n\n`;
+						if (record.markdown || (record.content && record.content.markdown)) {
+							combinedMarkdown += (record.markdown || record.content.markdown) + '\n\n';
+							hasContent = true;
+						}
+						
+						if (record.html || (record.content && record.content.html)) {
+							const htmlStr = record.html || record.content.html;
+							combinedMarkdown += `### HTML Content\n\`\`\`html\n${htmlStr}\n\`\`\`\n\n`;
+							hasContent = true;
+						}
+						
+						if (record.json || (record.content && record.content.json)) {
+							const jsonStr = JSON.stringify(record.json || record.content.json, null, 2);
+							combinedMarkdown += `### Structured JSON\n\`\`\`json\n${jsonStr}\n\`\`\`\n\n`;
+							hasContent = true;
+						}
+						
+						if (!hasContent) {
+							combinedMarkdown += `*No extracted content returned for this page format configuration.*\n\n`;
 						}
 						combinedMarkdown += `---\n\n`;
 					}
 
-					// R2: Save the compiled Markdown file to the bucket
 					await env.MY_BUCKET.put(fileName, combinedMarkdown, {
 						httpMetadata: { contentType: 'text/markdown' }
 					});
 				}
 
 				await sendTelegramDocument(env.TELEGRAM_BOT_TOKEN, chatId, combinedMarkdown, fileName);
-				await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `✅ *Job Completed!* Markdown file delivered above.`);
+				await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `✅ *Job Completed!* Combined results delivered above.`);
 			} else {
 				let msg = `📊 *Job Status:* \`${status.toUpperCase()}\`\n\n`;
 				msg += `*Total Pages:* ${result.total || 0}\n*Finished:* ${result.finished || 0}\n*Skipped:* ${result.skipped || 0}`;
@@ -238,25 +377,41 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 	}
 }
 
-/**
- * Standard text dispatcher
- */
-async function sendTelegramMessage(token: string, chatId: number, text: string): Promise<void> {
+async function sendTelegramMessage(token: string, chatId: number, text: string, replyMarkup?: any): Promise<void> {
 	const url = `https://api.telegram.org/bot${token}/sendMessage`;
+	
+	const body: any = {
+		chat_id: chatId,
+		text,
+		parse_mode: 'Markdown'
+	};
+	if (replyMarkup) body.reply_markup = replyMarkup;
+
 	await fetch(url, {
 		method: 'POST',
 		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({
-			chat_id: chatId,
-			text,
-			parse_mode: 'Markdown'
-		}),
+		body: JSON.stringify(body),
 	});
 }
 
-/**
- * High-fidelity file delivery using Form-Data and Blobs natively supported in Workers
- */
+async function editTelegramMessage(token: string, chatId: number, messageId: number, text: string, replyMarkup?: any): Promise<void> {
+	const url = `https://api.telegram.org/bot${token}/editMessageText`;
+	
+	const body: any = {
+		chat_id: chatId,
+		message_id: messageId,
+		text,
+		parse_mode: 'Markdown'
+	};
+	if (replyMarkup) body.reply_markup = replyMarkup;
+
+	await fetch(url, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(body),
+	});
+}
+
 async function sendTelegramDocument(token: string, chatId: number, fileContent: string, fileName: string): Promise<void> {
 	const url = `https://api.telegram.org/bot${token}/sendDocument`;
 	
