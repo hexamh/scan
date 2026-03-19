@@ -1,6 +1,6 @@
 /**
  * Cloudflare Worker Telegram Bot - Web Crawler
- * Integrated with Browser Rendering /crawl endpoint and Workers KV.
+ * Integrated with Browser Rendering /crawl endpoint, Workers KV (Settings), and R2 (File Storage).
  */
 
 export interface Env {
@@ -8,12 +8,14 @@ export interface Env {
 	CLOUDFLARE_API_TOKEN: string;
 	TELEGRAM_BOT_TOKEN: string;
 	CRAWL_KV: KVNamespace;
+	MY_BUCKET: R2Bucket;
 }
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
+		// Setup Webhook endpoint
 		if (request.method === 'GET' && url.pathname === '/setup_webhook') {
 			const webhookUrl = `${url.origin}/webhook`;
 			const telegramApi = `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook?url=${encodeURIComponent(webhookUrl)}`;
@@ -27,6 +29,7 @@ export default {
 			}
 		}
 
+		// Webhook receiver
 		if (request.method === 'POST' && url.pathname === '/webhook') {
 			try {
 				const update: any = await request.json();
@@ -65,7 +68,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 		const parts = text.split(' ');
 		let jobId = parts[1];
 
-		// Smart UX: Look up the last known job if the user just typed `/status`
+		// KV: Look up the last known job if the user just typed `/status`
 		if (!jobId) {
 			jobId = await env.CRAWL_KV.get(`chat:${chatId}:latest_job`) as string;
 			if (!jobId) {
@@ -78,6 +81,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 		return;
 	}
 
+	// Handle standard URLs or JSON Configs
 	if (text.startsWith('{')) {
 		await initiateCrawl(text, chatId, env, true);
 		return;
@@ -129,7 +133,7 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 		if (data.success && (data.result?.job_id || data.result?.id)) {
 			const jobId = data.result.job_id || data.result.id;
 			
-			// Cache this ID as the active job for the user for ease of access
+			// KV: Cache this ID as the active job for the user for ease of access
 			await env.CRAWL_KV.put(`chat:${chatId}:latest_job`, jobId);
 
 			const successMsg = `✅ *Crawl Job Initiated!*\n\n*Target:* ${payload.url}\n*Job ID:* \`${jobId}\`\n\nCheck progress anytime by sending:\n\`/status\``;
@@ -144,7 +148,7 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 }
 
 /**
- * Validates job status and leverages KV for document caching
+ * Validates job status and leverages R2 for document generation and caching
  */
 async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promise<void> {
 	const apiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/crawl/${jobId}`;
@@ -166,12 +170,17 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 			const records = result.records || result.data || result.items;
 
 			if (status === 'completed' && Array.isArray(records)) {
-				const cacheKey = `job:${jobId}:markdown`;
+				const fileName = `crawled_content_${jobId}.md`;
+				let combinedMarkdown = '';
 				
-				// Fetch the compiled markdown from KV if it was already processed
-				let combinedMarkdown = await env.CRAWL_KV.get(cacheKey);
+				// R2: Check if we have already compiled and stored this document
+				const existingObject = await env.MY_BUCKET.get(fileName);
 
-				if (!combinedMarkdown) {
+				if (existingObject) {
+					// File exists in R2, fetch the text
+					combinedMarkdown = await existingObject.text();
+				} else {
+					// Compile markdown from the raw API records
 					combinedMarkdown = `# Crawl Results for Job ${jobId}\n\n`;
 					
 					for (const record of records) {
@@ -186,11 +195,13 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 						combinedMarkdown += `---\n\n`;
 					}
 
-					// Cache the final compiled payload for 30 days
-					await env.CRAWL_KV.put(cacheKey, combinedMarkdown, { expirationTtl: 2592000 });
+					// R2: Save the compiled Markdown file to the bucket for future access
+					await env.MY_BUCKET.put(fileName, combinedMarkdown, {
+						httpMetadata: { contentType: 'text/markdown' }
+					});
 				}
 
-				await sendTelegramDocument(env.TELEGRAM_BOT_TOKEN, chatId, combinedMarkdown, `crawled_content_${jobId}.md`);
+				await sendTelegramDocument(env.TELEGRAM_BOT_TOKEN, chatId, combinedMarkdown, fileName);
 				await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `✅ *Job Completed!* Markdown file delivered above.`);
 			} else {
 				let msg = `📊 *Job Status:* \`${status.toUpperCase()}\`\n\n`;
