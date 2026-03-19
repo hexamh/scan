@@ -311,8 +311,13 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 
 		const data: any = await response.json();
 
-		if (response.ok && data.success && (data.result?.job_id || data.result?.id)) {
-			const jobId = data.result.job_id || data.result.id;
+		// Safely extract jobId whether the API returns it as a direct string or nested object
+		let jobId: string | undefined;
+		if (data.result) {
+			jobId = typeof data.result === 'string' ? data.result : (data.result.job_id || data.result.id);
+		}
+
+		if (response.ok && data.success && jobId) {
 			await env.CRAWL_KV.put(`chat:${chatId}:latest_job`, jobId);
 
 			const cfgFmt = isJson ? "Custom JSON Payload" : `${payload.limit} pages | ${payload.depth} clicks | ${payload.render ? 'Rendered' : 'Static'} | ${(payload.formats as string[]).join(',')}`;
