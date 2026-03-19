@@ -142,7 +142,7 @@ async function handleMessage(message: TelegramMessage, env: Env): Promise<void> 
 	const text = message.text?.trim() || '';
 
 	if (text.startsWith('/start')) {
-		const welcomeMsg = `🤖 *Browser Rendering Crawl Bot*\n\n` + 
+		const welcomeMsg = `🤖 *Crawl Bot*\n\n` + 
 			`Send me a URL starting with \`http://\` or \`https://\` to automatically initiate a crawl using your customized settings.\n\n` +
 			`*Commands:*\n` +
 			`/settings - Configure limits, depths, formats, and behavior.\n` +
