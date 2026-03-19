@@ -1,6 +1,7 @@
 /**
  * Cloudflare Worker Telegram Bot - Web Crawler
- * Integrated with Browser Rendering /crawl endpoint, Workers KV (Settings), and R2 (File Storage).
+ * Integrated with Browser Rendering /crawl endpoint, Workers KV, and R2.
+ * Features: Easy CLI-style arguments for limit and depth.
  */
 
 export interface Env {
@@ -57,8 +58,13 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 
 	if (text.startsWith('/start')) {
 		const welcomeMsg = `🤖 *Crawl Bot*\n\n` + 
-			`Send me a URL to crawl, or a JSON payload for authenticated scraping.\n\n` +
-			`Use \`/status\` to check the progress of your latest job, or \`/status <job_id>\` for a specific run.`;
+			`Send me a URL to crawl. You can easily set a custom limit and depth by adding numbers after the URL.\n\n` +
+			`*Examples:*\n` +
+			`1. \`https://example.com\` (Defaults: 50k limit, 50k depth)\n` +
+			`2. \`https://example.com 100\` (Limit 100 pages)\n` +
+			`3. \`https://example.com 500 3\` (Limit 500 pages, Depth 3)\n\n` +
+			`_You can also still send a raw JSON configuration payload for authenticated scraping._\n\n` +
+			`Use \`/status\` to check the progress of your active job.`;
 		
 		await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, welcomeMsg);
 		return;
@@ -68,7 +74,6 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 		const parts = text.split(' ');
 		let jobId = parts[1];
 
-		// KV: Look up the last known job if the user just typed `/status`
 		if (!jobId) {
 			jobId = await env.CRAWL_KV.get(`chat:${chatId}:latest_job`) as string;
 			if (!jobId) {
@@ -81,12 +86,27 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 		return;
 	}
 
-	// Handle standard URLs or JSON Configs
+	// Handle standard URLs with easy parsing
+	if (text.startsWith('http://') || text.startsWith('https://')) {
+		// Split by spaces to extract URL, Limit, and Depth
+		const parts = text.split(/\s+/);
+		const targetUrl = parts[0];
+		
+		const limit = parts.length > 1 ? parseInt(parts[1], 10) : 50000;
+		const depth = parts.length > 2 ? parseInt(parts[2], 10) : 50000;
+
+		if (isNaN(limit) || isNaN(depth)) {
+			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, '⚠️ Limit and Depth must be valid numbers.\n*Example:* `https://example.com 100 2`');
+			return;
+		}
+
+		await initiateCrawl(targetUrl, chatId, env, false, limit, depth);
+		return;
+	} 
+	
+	// Handle raw JSON payloads for authenticated crawling
 	if (text.startsWith('{')) {
 		await initiateCrawl(text, chatId, env, true);
-		return;
-	} else if (text.startsWith('http://') || text.startsWith('https://')) {
-		await initiateCrawl(text, chatId, env, false);
 		return;
 	}
 
@@ -96,7 +116,7 @@ async function handleMessage(message: any, env: Env): Promise<void> {
 /**
  * Initiates a new crawl and saves state to KV
  */
-async function initiateCrawl(input: string, chatId: number, env: Env, isJson: boolean): Promise<void> {
+async function initiateCrawl(input: string, chatId: number, env: Env, isJson: boolean, customLimit = 50000, customDepth = 50000): Promise<void> {
 	const apiUrl = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/browser-rendering/crawl`;
 	
 	let payload: Record<string, unknown>;
@@ -105,6 +125,8 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 		try {
 			payload = JSON.parse(input);
 			if (!payload.formats) payload.formats = ["markdown"];
+			if (payload.limit === undefined) payload.limit = customLimit;
+			if (payload.depth === undefined) payload.depth = customDepth;
 		} catch (e) {
 			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, `❌ *Invalid JSON Configuration.*\nVerify your formatting and try again.`);
 			return;
@@ -113,8 +135,8 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 		payload = {
 			url: input,
 			formats: ["markdown"], 
-			limit: 10,
-			depth: 1
+			limit: customLimit,
+			depth: customDepth
 		};
 	}
 
@@ -133,10 +155,10 @@ async function initiateCrawl(input: string, chatId: number, env: Env, isJson: bo
 		if (data.success && (data.result?.job_id || data.result?.id)) {
 			const jobId = data.result.job_id || data.result.id;
 			
-			// KV: Cache this ID as the active job for the user for ease of access
+			// KV: Cache this ID as the active job for the user
 			await env.CRAWL_KV.put(`chat:${chatId}:latest_job`, jobId);
 
-			const successMsg = `✅ *Crawl Job Initiated!*\n\n*Target:* ${payload.url}\n*Job ID:* \`${jobId}\`\n\nCheck progress anytime by sending:\n\`/status\``;
+			const successMsg = `✅ *Crawl Job Initiated!*\n\n*Target:* ${payload.url}\n*Job ID:* \`${jobId}\`\n*Config:* ${payload.limit} pages | ${payload.depth} clicks deep\n\nCheck progress anytime by sending:\n\`/status\``;
 			await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, successMsg);
 		} else {
 			const errorMsg = data.errors?.[0]?.message || 'Unknown error occurred.';
@@ -177,7 +199,6 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 				const existingObject = await env.MY_BUCKET.get(fileName);
 
 				if (existingObject) {
-					// File exists in R2, fetch the text
 					combinedMarkdown = await existingObject.text();
 				} else {
 					// Compile markdown from the raw API records
@@ -190,12 +211,12 @@ async function checkCrawlStatus(jobId: string, chatId: number, env: Env): Promis
 						if (md) {
 							combinedMarkdown += md + '\n\n';
 						} else {
-							combinedMarkdown += `*No markdown returned for this page. (Ensure 'formats': ['markdown'] was set)*\n\n`;
+							combinedMarkdown += `*No markdown returned for this page.*\n\n`;
 						}
 						combinedMarkdown += `---\n\n`;
 					}
 
-					// R2: Save the compiled Markdown file to the bucket for future access
+					// R2: Save the compiled Markdown file to the bucket
 					await env.MY_BUCKET.put(fileName, combinedMarkdown, {
 						httpMetadata: { contentType: 'text/markdown' }
 					});
